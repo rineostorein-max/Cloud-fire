@@ -1,819 +1,1010 @@
 /**
- * Multi-Platform Media Extractor & CORS Streaming Proxy
- * Supports: YouTube (InnerTube 1080p/4K MP4 + M4A), Instagram, Threads, Twitter/X, Facebook, Snapchat
- * Zero Paid APIs | Modular Architecture
+ * Cloudflare Worker: Universal Social Media Media Downloader API
+ * Runtime: ES Modules (V8 Isolate - Zero external dependencies)
  */
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
+];
+
+// Public Twitter Web App Bearer Token & Default TweetResultByRestId GraphQL Query ID
+const TWITTER_BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+const DEFAULT_X_GRAPHQL_ID = "0hWvDhmW8YQ-S_ib3azIrw";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Range, Authorization, X-Requested-With",
-  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type",
-  "Cross-Origin-Resource-Policy": "cross-origin"
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Content-Type": "application/json; charset=utf-8"
 };
 
-const DEFAULT_UA =
-  "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36";
-
-// ==========================================
-// 1. MODULAR PLATFORM REGISTRY (പുതിയവ ഇവിടെ ചേർക്കാം)
-// ==========================================
-const PLATFORM_HANDLERS = [
-  {
-    name: "youtube",
-    match: (url) => /(?:youtube\.com|youtu\.be)/i.test(url),
-    handler: extractYouTube
-  },
-  {
-    name: "instagram",
-    match: (url) => /instagram\.com/i.test(url),
-    handler: extractInstagram
-  },
-  {
-    name: "threads",
-    match: (url) => /threads\.(?:net|com)/i.test(url),
-    handler: extractThreads
-  },
-  {
-    name: "twitter",
-    match: (url) => /(?:twitter\.com|x\.com)/i.test(url),
-    handler: extractTwitter
-  },
-  {
-    name: "facebook",
-    match: (url) => /(?:facebook\.com|fb\.watch|fb\.com)/i.test(url),
-    handler: extractFacebook
-  },
-  {
-    name: "snapchat",
-    match: (url) => /snapchat\.com/i.test(url),
-    handler: extractSnapchat
-  }
-  // ഭാവിയിൽ പുതിയ പ്ലാറ്റ്‌ഫോം ചേർക്കാൻ:
-  // { name: "pinterest", match: (url) => /pinterest\.com|pin\.it/i.test(url), handler: extractPinterest }
-];
-
-// ==========================================
-// 2. WORKER ENTRY POINT & ROUTER
-// ==========================================
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
+    // 1. Handle CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    const reqUrl = new URL(request.url);
-    const pathname = reqUrl.pathname;
-
     try {
-      // റൂട്ട് 1: Built-in CORS Media Proxy (/proxy?url=...)
-      if (pathname === "/proxy") {
-        const mediaUrl = reqUrl.searchParams.get("url");
-        if (!mediaUrl) {
-          return jsonResponse({ status: "error", message: "Missing 'url' parameter for proxy." }, 400);
+      // 2. Extract URL from GET query or POST JSON body
+      let targetUrl = null;
+      const reqUrl = new URL(request.url);
+
+      if (request.method === "GET") {
+        targetUrl = reqUrl.searchParams.get("url");
+      } else if (request.method === "POST") {
+        const contentType = request.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const body = await request.json().catch(() => ({}));
+          targetUrl = body.url;
         }
-        return await handleProxyRequest(request, mediaUrl);
+      } else {
+        return jsonResponse({ success: false, error: "Method not allowed. Use GET or POST." }, 405);
       }
 
-      // റൂട്ട് 2: Media Extraction (GET /?url=... അല്ലെങ്കിൽ POST /)
-      let targetUrl = reqUrl.searchParams.get("url");
-      if (!targetUrl && request.method === "POST") {
-        const body = await request.json().catch(() => ({}));
-        targetUrl = body.url;
+      if (!targetUrl || typeof targetUrl !== "string") {
+        return jsonResponse({
+          success: false,
+          error: "Missing 'url' parameter. Provide ?url=... via GET or {\"url\": \"...\"} via POST."
+        }, 400);
       }
 
-      if (!targetUrl) {
-        return jsonResponse(
-          {
-            status: "error",
-            message: "Provide a target link via ?url= or POST JSON body.",
-            endpoints: {
-              extract: "/?url=<SOCIAL_MEDIA_URL>",
-              proxy: "/proxy?url=<ENCODED_MEDIA_STREAM_URL>"
-            }
-          },
-          400
-        );
+      // Validate URL format & SSRF rules
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(targetUrl.trim());
+      } catch {
+        return jsonResponse({ success: false, error: "Invalid URL format provided." }, 400);
       }
 
-      // പ്ലാറ്റ്‌ഫോം തിരിച്ചറിഞ്ഞ് അതിന്റെ ഫങ്ഷൻ പ്രവർത്തിപ്പിക്കുന്നു
-      const platformModule = PLATFORM_HANDLERS.find((p) => p.match(targetUrl));
-      if (!platformModule) {
-        return jsonResponse({ status: "error", message: "Unsupported platform URL." }, 400);
+      const ssrfCheck = validateSafeUrl(parsedUrl);
+      if (!ssrfCheck.valid) {
+        return jsonResponse({ success: false, error: ssrfCheck.reason }, 400);
       }
 
-      const rawData = await platformModule.handler(targetUrl, reqUrl.origin);
-      return jsonResponse(createUnifiedResponse(platformModule.name, targetUrl, rawData, reqUrl.origin));
+      // 3. Strictly Exclude YouTube (Pre-redirect check)
+      if (isYouTubeUrl(parsedUrl.hostname)) {
+        return jsonResponse({ success: false, error: "YouTube downloads are not supported" }, 400);
+      }
+
+      // 4. Resolve shortened URLs safely with SSRF validation across hops
+      const resolvedUrlStr = await resolveRedirects(parsedUrl.toString());
+      const resolvedUrl = new URL(resolvedUrlStr);
+
+      const postRedirectSsrfCheck = validateSafeUrl(resolvedUrl);
+      if (!postRedirectSsrfCheck.valid) {
+        return jsonResponse({ success: false, error: postRedirectSsrfCheck.reason }, 400);
+      }
+
+      // Re-verify YouTube exclusion after resolving shortened URLs
+      if (isYouTubeUrl(resolvedUrl.hostname)) {
+        return jsonResponse({ success: false, error: "YouTube downloads are not supported" }, 400);
+      }
+
+      // 5. Route by Platform
+      const platform = detectPlatform(resolvedUrl.hostname);
+      if (!platform) {
+        return jsonResponse({
+          success: false,
+          error: `Unsupported platform (${resolvedUrl.hostname}). Supported: Instagram, X/Twitter, Pinterest, Reddit, Facebook.`
+        }, 400);
+      }
+
+      let result;
+      switch (platform) {
+        case "x":
+          result = await extractX(resolvedUrl, env);
+          break;
+        case "reddit":
+          result = await extractReddit(resolvedUrl);
+          break;
+        case "instagram":
+          result = await extractInstagram(resolvedUrl, env);
+          break;
+        case "pinterest":
+          result = await extractPinterest(resolvedUrl);
+          break;
+        case "facebook":
+          result = await extractFacebook(resolvedUrl, env);
+          break;
+      }
+
+      if (!result || !result.media || result.media.length === 0) {
+        return jsonResponse({
+          success: false,
+          error: `Could not extract downloadable media from ${platform}. Ensure the post is public and contains video or image media.`
+        }, 404);
+      }
+
+      return jsonResponse({
+        success: true,
+        platform,
+        title: result.title || `${platform.toUpperCase()} Media`,
+        thumbnail: result.thumbnail || null,
+        media: result.media
+      }, 200);
+
     } catch (err) {
-      return jsonResponse(
-        {
-          status: "error",
-          message: err.message || "Extraction failed",
-          stack: err.stack ? err.stack.split("\n")[0] : undefined
-        },
-        500
-      );
+      return jsonResponse({
+        success: false,
+        error: err.message || "Internal Worker extraction error."
+      }, 500);
     }
   }
 };
 
-// ==========================================
-// 3. UNIFIED JSON OUTPUT BUILDER
-// ==========================================
-function createUnifiedResponse(platform, originalUrl, data, workerOrigin) {
-  const wrapProxy = (mediaUrl) =>
-    mediaUrl ? `${workerOrigin}/proxy?url=${encodeURIComponent(mediaUrl)}` : null;
-
-  return {
-    status: "success",
-    platform,
-    originalUrl,
-    title: data.title || `${platform.toUpperCase()} Media`,
-    thumbnail: data.thumbnail || null,
-    proxiedThumbnail: wrapProxy(data.thumbnail),
-    // സാധാരണ വീഡിയോ+ഓഡിയോ ഒന്നിച്ചുള്ള ഫയലുകൾ
-    videos: (data.videos || []).map((v) => ({
-      quality: v.quality || "HD",
-      mimeType: v.mimeType || "video/mp4",
-      width: v.width || null,
-      height: v.height || null,
-      url: v.url,
-      proxyUrl: wrapProxy(v.url)
-    })),
-    // YouTube 1080p/4K പോലുള്ള Video-Only MP4 സ്ട്രീമുകൾ (MP4Box.js-ന് വേണ്ടി)
-    dashVideos: (data.dashVideos || []).map((dv) => ({
-      itag: dv.itag || null,
-      quality: dv.quality || `${dv.height}p`,
-      width: dv.width || null,
-      height: dv.height || null,
-      fps: dv.fps || 30,
-      codecs: dv.codecs || "avc1",
-      mimeType: dv.mimeType || "video/mp4",
-      contentLength: dv.contentLength ? Number(dv.contentLength) : null,
-      url: dv.url,
-      proxyUrl: wrapProxy(dv.url)
-    })),
-    // ഏറ്റവും മികച്ച M4A ഓഡിയോ സ്ട്രീം (MP4Box.js-ൽ കൂട്ടിച്ചേർക്കാൻ)
-    bestAudio: data.bestAudio
-      ? {
-          itag: data.bestAudio.itag || null,
-          bitrate: data.bestAudio.bitrate || null,
-          codecs: data.bestAudio.codecs || "mp4a.40.2",
-          mimeType: data.bestAudio.mimeType || "audio/mp4",
-          contentLength: data.bestAudio.contentLength ? Number(data.bestAudio.contentLength) : null,
-          url: data.bestAudio.url,
-          proxyUrl: wrapProxy(data.bestAudio.url)
-        }
-      : null,
-    // ഫോട്ടോകൾ / കറൗസൽ ഇമേജുകൾ
-    images: (data.images || []).map((img) => ({
-      url: typeof img === "string" ? img : img.url,
-      width: img.width || null,
-      height: img.height || null,
-      proxyUrl: wrapProxy(typeof img === "string" ? img : img.url)
-    }))
-  };
-}
-
-// ==========================================
-// 4. BUILT-IN CORS STREAMING PROXY (/proxy)
-// ==========================================
-async function handleProxyRequest(request, targetUrl) {
-  let parsedTarget;
-  try {
-    parsedTarget = new URL(targetUrl);
-  } catch {
-    return jsonResponse({ status: "error", message: "Invalid target URL in proxy." }, 400);
-  }
-
-  const upstreamHeaders = new Headers();
-  upstreamHeaders.set("User-Agent", DEFAULT_UA);
-  upstreamHeaders.set("Accept", "*/*");
-
-  // MP4Box.js-നും വീഡിയോ സീക്കിങ്ങിനും അനിവാര്യമായ Range Header കൈമാറുന്നു
-  const rangeHeader = request.headers.get("Range");
-  if (rangeHeader) {
-    upstreamHeaders.set("Range", rangeHeader);
-  }
-
-  // ഓരോ പ്ലാറ്റ്‌ഫോമിന്റെയും CDN ബ്ലോക്കിങ് ഒഴിവാക്കാൻ ഉചിതമായ Referer നൽകുന്നു
-  if (parsedTarget.hostname.includes("instagram") || parsedTarget.hostname.includes("fbcdn")) {
-    upstreamHeaders.set("Referer", "https://www.instagram.com/");
-  } else if (parsedTarget.hostname.includes("twimg.com")) {
-    upstreamHeaders.set("Referer", "https://x.com/");
-  } else if (parsedTarget.hostname.includes("googlevideo.com")) {
-    upstreamHeaders.set("Origin", "https://www.youtube.com");
-    upstreamHeaders.set("Referer", "https://www.youtube.com/");
-  }
-
-  const upstreamResponse = await fetch(parsedTarget.toString(), {
-    method: request.method === "HEAD" ? "HEAD" : "GET",
-    headers: upstreamHeaders,
-    redirect: "follow"
-  });
-
-  const responseHeaders = new Headers(CORS_HEADERS);
-  const passthroughHeaders = [
-    "content-type",
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "cache-control",
-    "etag"
-  ];
-
-  for (const h of passthroughHeaders) {
-    const val = upstreamResponse.headers.get(h);
-    if (val) responseHeaders.set(h, val);
-  }
-
-  return new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    headers: responseHeaders
-  });
-}
-
-// ==========================================
-// 5. PLATFORM EXTRACTOR MODULES
-// ==========================================
+/* ============================================================================
+ * SSRF VALIDATION & SAFE REDIRECT RESOLUTION
+ * ========================================================================== */
 
 /**
- * MODULE 1: YOUTUBE (InnerTube API - youtubei/v1/player)
- * Extracts 1080p/4K MP4 DASH video streams & M4A audio stream for MP4Box.js
+ * Validates that a URL object uses http/https and does not point to
+ * loopback, private, link-local, or internal hostnames/IP ranges.
  */
-async function extractYouTube(url) {
-  const videoId = parseYouTubeId(url);
-  if (!videoId) throw new Error("Invalid YouTube video ID.");
-
-  // ANDROID_VR ക്ലയന്റ് വഴി സൈഫർ ഇല്ലാത്ത നേരിട്ടുള്ള 1080p/4K സ്ട്രീമുകൾ ലഭിക്കുന്നു
-  const innertubePayload = {
-    videoId,
-    context: {
-      client: {
-        clientName: "ANDROID_VR",
-        clientVersion: "1.60.19",
-        androidSdkVersion: 34,
-        userAgent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)",
-        hl: "en",
-        gl: "US",
-        timeZone: "UTC",
-        utcOffsetMinutes: 0
-      }
-    },
-    contentCheckOk: true,
-    racyCheckOk: true
-  };
-
-  const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": innertubePayload.context.client.userAgent,
-      "X-YouTube-Client-Name": "28",
-      "X-YouTube-Client-Version": "1.60.19"
-    },
-    body: JSON.stringify(innertubePayload)
-  });
-
-  if (!res.ok) throw new Error(`YouTube InnerTube error: ${res.status}`);
-  const data = await res.json();
-
-  if (data.playabilityStatus?.status !== "OK") {
-    throw new Error(data.playabilityStatus?.reason || "YouTube video unavailable or restricted.");
+function validateSafeUrl(urlObj) {
+  if (urlObj.protocol !== "http:" && urlObj.protocol !== "https:") {
+    return { valid: false, reason: "Invalid URL protocol. Only HTTP and HTTPS are allowed." };
   }
 
-  const streamingData = data.streamingData || {};
-  const formats = streamingData.formats || [];
-  const adaptiveFormats = streamingData.adaptiveFormats || [];
+  // Strip IPv6 brackets if present
+  const hostname = urlObj.hostname.toLowerCase().replace(/^\[|\]$/g, "");
 
-  // 1. Combined Video + Audio (360p / 720p)
-  const videos = formats
-    .filter((f) => f.url && f.mimeType?.includes("video/mp4"))
-    .map((f) => ({
-      quality: f.qualityLabel || `${f.height}p`,
-      width: f.width,
-      height: f.height,
-      mimeType: "video/mp4",
-      url: f.url
-    }));
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    hostname.endsWith(".internal")
+  ) {
+    return { valid: false, reason: "Access to local or internal hostnames is forbidden." };
+  }
 
-  // 2. DASH MP4 Video-Only Streams (1080p, 1440p, 4K - MP4Box.js അനുയോജ്യമായവ)
-  const dashVideos = adaptiveFormats
-    .filter((f) => f.url && f.mimeType?.startsWith("video/mp4"))
-    .sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0))
-    .map((f) => {
-      const codecMatch = f.mimeType.match(/codecs="([^"]+)"/);
-      return {
-        itag: f.itag,
-        quality: f.qualityLabel || `${f.height}p`,
-        width: f.width,
-        height: f.height,
-        fps: f.fps || 30,
-        codecs: codecMatch ? codecMatch[1] : "avc1",
-        mimeType: "video/mp4",
-        contentLength: f.contentLength,
-        url: f.url
-      };
-    });
+  // IPv6 loopback, unspecified, link-local (fe80::/10), unique local (fc00::/7), or IPv4-mapped IPv6
+  if (hostname.includes(":")) {
+    if (
+      hostname === "::1" ||
+      hostname === "::" ||
+      hostname === "0:0:0:0:0:0:0:1" ||
+      hostname === "0:0:0:0:0:0:0:0" ||
+      hostname.startsWith("fe80:") ||
+      hostname.startsWith("fc") ||
+      hostname.startsWith("fd") ||
+      hostname.startsWith("::ffff:")
+    ) {
+      return { valid: false, reason: "Access to private or loopback IPv6 addresses is forbidden." };
+    }
+  }
 
-  // 3. Best M4A Audio Stream (audio/mp4)
-  const m4aAudios = adaptiveFormats
-    .filter((f) => f.url && f.mimeType?.startsWith("audio/mp4"))
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  // IPv4 numeric validation
+  const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const ipv4Match = hostname.match(ipv4Regex);
+  if (ipv4Match) {
+    const octets = ipv4Match.slice(1, 5).map(Number);
+    if (octets.some(o => o > 255)) {
+      return { valid: false, reason: "Invalid IPv4 address." };
+    }
+    const [a, b] = octets;
+    if (
+      a === 0 ||                                // 0.0.0.0/8 (Current network)
+      a === 10 ||                               // 10.0.0.0/8 (Private)
+      a === 127 ||                              // 127.0.0.0/8 (Loopback)
+      (a === 169 && b === 254) ||               // 169.254.0.0/16 (Link-local / Cloud metadata)
+      (a === 172 && b >= 16 && b <= 31) ||      // 172.16.0.0/12 (Private)
+      (a === 192 && b === 168) ||               // 192.168.0.0/16 (Private)
+      (a === 100 && b >= 64 && b <= 127)        // 100.64.0.0/10 (Carrier-grade NAT)
+    ) {
+      return { valid: false, reason: "Access to private, loopback, or reserved IPv4 ranges is forbidden." };
+    }
+  }
 
-  const topAudio = m4aAudios[0] || null;
-  const bestAudio = topAudio
-    ? {
-        itag: topAudio.itag,
-        bitrate: topAudio.bitrate,
-        codecs: topAudio.mimeType.match(/codecs="([^"]+)"/)?.[1] || "mp4a.40.2",
-        mimeType: "audio/mp4",
-        contentLength: topAudio.contentLength,
-        url: topAudio.url
-      }
-    : null;
-
-  const thumbs = data.videoDetails?.thumbnail?.thumbnails || [];
-  const bestThumb =
-    thumbs.length > 0
-      ? thumbs[thumbs.length - 1].url
-      : `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
-
-  return {
-    title: data.videoDetails?.title || "YouTube Video",
-    thumbnail: bestThumb,
-    videos,
-    dashVideos,
-    bestAudio,
-    images: []
-  };
-}
-
-function parseYouTubeId(url) {
-  const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i;
-  const match = url.match(regex);
-  return match ? match[1] : null;
+  return { valid: true };
 }
 
 /**
- * MODULE 2: TWITTER / X
- * Uses Twitter Public Syndication & VX/FX fallback for Direct Original MP4 & Images
+ * Resolves redirects step-by-step (up to 5 hops) while validating every intermediate
+ * Location target against SSRF rules before fetching.
  */
-async function extractTwitter(url) {
-  const match = url.match(/(?:twitter\.com|x\.com)\/[^\/]+\/status\/(\d+)/i);
-  if (!match) throw new Error("Invalid Twitter/X status URL.");
+async function resolveRedirects(initialUrl, maxRedirects = 5) {
+  let currentUrl = initialUrl;
+
+  for (let i = 0; i < maxRedirects; i++) {
+    let parsedCurrent;
+    try {
+      parsedCurrent = new URL(currentUrl);
+    } catch {
+      throw new Error("Malformed URL encountered during redirect resolution.");
+    }
+
+    const check = validateSafeUrl(parsedCurrent);
+    if (!check.valid) {
+      throw new Error(check.reason);
+    }
+
+    let res;
+    try {
+      res = await fetch(currentUrl, {
+        method: "HEAD",
+        redirect: "manual",
+        headers: getSpoofedHeaders()
+      });
+      // Some servers reject HEAD with 405/403; retry with manual GET
+      if (res.status === 405 || res.status === 403) {
+        res = await fetch(currentUrl, {
+          method: "GET",
+          redirect: "manual",
+          headers: getSpoofedHeaders()
+        });
+      }
+    } catch {
+      break;
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) break;
+
+      const nextUrl = new URL(location, currentUrl);
+      const nextCheck = validateSafeUrl(nextUrl);
+      if (!nextCheck.valid) {
+        throw new Error(`Redirect blocked: ${nextCheck.reason}`);
+      }
+      currentUrl = nextUrl.toString();
+    } else {
+      break;
+    }
+  }
+
+  return currentUrl;
+}
+
+/* ============================================================================
+ * PLATFORM EXTRACTORS
+ * ========================================================================== */
+
+/**
+ * X / Twitter Extractor
+ * Uses Syndication API first, then falls back to Guest Token + Configurable GraphQL Query ID
+ */
+async function extractX(urlObj, env) {
+  const match = urlObj.pathname.match(/\/(?:status|statuses)\/(\d+)/);
+  if (!match) {
+    throw new Error("Could not find a valid Tweet/X status ID in the URL.");
+  }
   const tweetId = match[1];
 
-  // രീതി 1: Public API endpoint (api.vxtwitter.com) - Direct Twitter CDN URLs നൽകുന്നു
-  const vxRes = await fetch(`https://api.vxtwitter.com/Twitter/status/${tweetId}`, {
-    headers: { "User-Agent": DEFAULT_UA }
+  // Method 1: Syndication Endpoint
+  try {
+    const token = computeSyndicationToken(tweetId);
+    const syndicationUrl = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en&token=${token}`;
+    const res = await fetch(syndicationUrl, {
+      headers: getSpoofedHeaders({ Referer: "https://platform.twitter.com/" })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const parsed = parseSyndicationData(data);
+      if (parsed && parsed.media.length > 0) return parsed;
+    }
+  } catch (_) {
+    // Fall through to Method 2
+  }
+
+  // Method 2: Activate Guest Token + Query Configurable GraphQL Endpoint
+  const bearer = env.X_BEARER_TOKEN || TWITTER_BEARER_TOKEN;
+  const graphqlQueryId = (env.X_GRAPHQL_ID && env.X_GRAPHQL_ID.trim()) || DEFAULT_X_GRAPHQL_ID;
+
+  const guestRes = await fetch("https://api.x.com/1.1/guest/activate.json", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${bearer}`,
+      "User-Agent": getRandomUA()
+    }
   });
 
-  if (vxRes.ok) {
-    const vxData = await vxRes.json();
-    const videos = [];
-    const images = [];
-
-    for (const media of vxData.media_extended || []) {
-      if (media.type === "video" || media.type === "gif") {
-        videos.push({
-          quality: "Original HD",
-          width: media.size?.width,
-          height: media.size?.height,
-          mimeType: "video/mp4",
-          url: media.url
-        });
-      } else if (media.type === "image") {
-        const origImg = media.url.includes("?") ? media.url : `${media.url}?name=orig`;
-        images.push({
-          url: origImg,
-          width: media.size?.width,
-          height: media.size?.height
-        });
-      }
-    }
-
-    return {
-      title: vxData.text ? vxData.text.slice(0, 90) : "X Post",
-      thumbnail: vxData.media_extended?.[0]?.thumbnail_url || images[0]?.url || null,
-      videos,
-      images
-    };
+  if (!guestRes.ok) {
+    throw new Error("Failed to acquire X Guest Token and Syndication fallback returned no media.");
   }
 
-  // രീതി 2: Twitter Official Syndication Fallback
-  const token = ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, "");
-  const synRes = await fetch(
-    `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&token=${token}`,
-    { headers: { "User-Agent": DEFAULT_UA } }
-  );
+  const { guest_token } = await guestRes.json();
 
-  if (!synRes.ok) throw new Error("Unable to fetch X/Twitter media.");
-  const synData = await synRes.json();
+  const features = {
+    creator_subscriptions_tweet_preview_api_enabled: true,
+    tweetypie_unmention_optimization_enabled: true,
+    responsive_web_edit_tweet_api_enabled: true,
+    graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
+    view_counts_everywhere_api_enabled: true,
+    longform_notetweets_consumption_enabled: true,
+    tweet_awards_web_tipping_enabled: false,
+    freedom_of_speech_not_reach_fetch_enabled: true,
+    standardized_nudges_misinfo: true,
+    longform_notetweets_rich_text_read_enabled: true,
+    responsive_web_enhance_cards_enabled: false
+  };
 
-  const videos = [];
-  const images = [];
+  const variables = {
+    tweetId: tweetId,
+    withCommunity: false,
+    includePromotedContent: false,
+    withVoice: false
+  };
 
-  for (const media of synData.mediaDetails || []) {
-    if (media.type === "video" || media.type === "animated_gif") {
-      const mp4Variants = (media.video_info?.variants || [])
-        .filter((v) => v.content_type === "video/mp4")
+  const graphqlUrl = `https://api.x.com/graphql/${encodeURIComponent(graphqlQueryId)}/TweetResultByRestId?variables=${encodeURIComponent(JSON.stringify(variables))}&features=${encodeURIComponent(JSON.stringify(features))}`;
+
+  const gqlRes = await fetch(graphqlUrl, {
+    headers: {
+      "Authorization": `Bearer ${bearer}`,
+      "x-guest-token": guest_token,
+      "User-Agent": getRandomUA(),
+      "Accept": "application/json"
+    }
+  });
+
+  if (!gqlRes.ok) {
+    if (gqlRes.status === 400 || gqlRes.status === 404) {
+      throw new Error(
+        `X GraphQL endpoint returned HTTP ${gqlRes.status}. The GraphQL Query ID (${graphqlQueryId}) may have rotated—update X_GRAPHQL_ID in Worker Secrets.`
+      );
+    }
+    throw new Error(`X GraphQL request failed with status ${gqlRes.status}`);
+  }
+
+  const gqlData = await gqlRes.json().catch(() => null);
+  if (!gqlData || (gqlData.errors && !gqlData.data)) {
+    const errMsg = gqlData?.errors?.[0]?.message || "Invalid GraphQL response structure.";
+    throw new Error(`X GraphQL query error: ${errMsg}. Consider updating X_GRAPHQL_ID.`);
+  }
+
+  const legacy = gqlData?.data?.tweetResult?.result?.legacy || gqlData?.data?.tweetResult?.result?.tweet?.legacy;
+  if (!legacy) {
+    throw new Error("Tweet data unavailable, age-restricted, or protected.");
+  }
+
+  const title = cleanText(legacy.full_text || "X Video");
+  let thumbnail = null;
+  const mediaList = [];
+
+  const entities = legacy.extended_entities?.media || legacy.entities?.media || [];
+  for (const item of entities) {
+    if (!thumbnail && item.media_url_https) {
+      thumbnail = item.media_url_https;
+    }
+
+    if (item.type === "video" || item.type === "animated_gif") {
+      const variants = (item.video_info?.variants || [])
+        .filter(v => v.content_type === "video/mp4")
         .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
-      for (const v of mp4Variants) {
-        const resMatch = v.url.match(/\/(\d+x\d+)\//);
-        videos.push({
-          quality: resMatch ? resMatch[1] : `${Math.round((v.bitrate || 0) / 1000)}kbps`,
-          mimeType: "video/mp4",
-          url: v.url
+      if (variants.length > 0) {
+        mediaList.push({
+          url: variants[0].url,
+          quality: variants[0].bitrate >= 2000000 ? "HD" : "SD",
+          type: "video"
         });
       }
-    } else if (media.type === "photo") {
-      images.push({ url: `${media.media_url_https}?name=orig` });
+    } else if (item.type === "photo" && item.media_url_https) {
+      mediaList.push({
+        url: `${item.media_url_https}?name=orig`,
+        quality: "HD",
+        type: "image"
+      });
     }
   }
 
-  return {
-    title: synData.text ? synData.text.slice(0, 90) : "X Post",
-    thumbnail: synData.photos?.[0]?.url || synData.video?.poster || null,
-    videos,
-    images
-  };
+  return { title, thumbnail, media: mediaList };
 }
 
 /**
- * MODULE 3: INSTAGRAM
- * Extracts Reels, Posts & Carousels via Direct GraphQL & Embed Endpoints
+ * Reddit Extractor
+ * Uses the .json suffix trick and probes v.redd.it DASH audio streams via HEAD requests
  */
-async function extractInstagram(url) {
-  const match = url.match(/instagram\.com\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
-  if (!match) throw new Error("Invalid Instagram URL. Provide a valid Post or Reel link.");
-  const shortcode = match[1];
+async function extractReddit(urlObj) {
+  const cleanPath = urlObj.pathname.replace(/\/+$/, "");
+  const jsonUrl = `https://www.reddit.com${cleanPath}.json?raw_json=1`;
 
-  const videos = [];
-  const images = [];
-  let thumbnail = null;
-  let title = "Instagram Media";
-
-  // രീതി 1: Instagram Public GraphQL Query
-  const gqlParams = new URLSearchParams({
-    av: "0",
-    __d: "www",
-    __user: "0",
-    __a: "1",
-    __req: "3",
-    __ccg: "EXCELLENT",
-    variables: JSON.stringify({
-      shortcode,
-      fetch_comment_count: 0,
-      fetch_related_profile_media_count: 0,
-      parent_comment_count: 0,
-      child_comment_count: 0,
-      fetch_like_count: 0,
-      fetch_tagged_user_count: null,
-      fetch_preview_comment_count: 0,
-      has_threaded_comments: false,
-      hoisted_comment_id: null,
-      hoisted_reply_id: null
-    }),
-    doc_id: "10015901848480474"
+  const res = await fetch(jsonUrl, {
+    headers: getSpoofedHeaders({
+      Accept: "application/json",
+      Referer: "https://www.reddit.com/"
+    })
   });
 
-  const gqlRes = await fetch("https://www.instagram.com/api/graphql", {
-    method: "POST",
-    headers: {
-      "User-Agent": DEFAULT_UA,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "X-IG-App-ID": "936619743392459",
-      "X-FB-LSD": "AVqbxe3J_YA",
-      "X-ASBD-ID": "129477",
-      "Sec-Fetch-Site": "same-origin"
-    },
-    body: gqlParams.toString()
+  if (!res.ok) {
+    throw new Error(`Reddit API returned HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  const post = Array.isArray(data)
+    ? data[0]?.data?.children?.[0]?.data
+    : data?.data?.children?.[0]?.data;
+
+  if (!post) {
+    throw new Error("Unable to parse Reddit post data.");
+  }
+
+  const targetPost = (post.crosspost_parent_list && post.crosspost_parent_list[0]) || post;
+
+  const title = targetPost.title || "Reddit Media";
+  let thumbnail = targetPost.preview?.images?.[0]?.source?.url || targetPost.thumbnail || null;
+  if (thumbnail && !thumbnail.startsWith("http")) thumbnail = null;
+
+  const media = [];
+
+  // 1. Native Reddit Video (v.redd.it) + DASH Audio Stream Probing
+  const redditVideo = targetPost.secure_media?.reddit_video || targetPost.media?.reddit_video || targetPost.preview?.reddit_video_preview;
+  if (redditVideo && redditVideo.fallback_url) {
+    const cleanVideoUrl = redditVideo.fallback_url.split("?")[0];
+    media.push({
+      url: cleanVideoUrl,
+      quality: redditVideo.height >= 720 ? "HD" : "SD",
+      type: "video"
+    });
+
+    // Probe for separate DASH audio stream if this isn't a silent GIF
+    if (!redditVideo.is_gif) {
+      const basePath = cleanVideoUrl.substring(0, cleanVideoUrl.lastIndexOf("/"));
+      if (basePath.startsWith("http")) {
+        const audioCandidates = [
+          `${basePath}/DASH_AUDIO_128.mp4`,
+          `${basePath}/DASH_AUDIO_64.mp4`,
+          `${basePath}/DASH_audio.mp4`,
+          `${basePath}/audio`
+        ];
+
+        for (const candidateUrl of audioCandidates) {
+          try {
+            const audioHead = await fetch(candidateUrl, {
+              method: "HEAD",
+              headers: getSpoofedHeaders({ Referer: "https://www.reddit.com/" })
+            });
+            if (audioHead.ok && audioHead.status === 200) {
+              media.push({
+                url: candidateUrl,
+                quality: "Audio",
+                type: "audio"
+              });
+              break;
+            }
+          } catch (_) {
+            // Try next audio filename candidate
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Reddit Gallery
+  if (targetPost.is_gallery && targetPost.media_metadata) {
+    for (const key of Object.keys(targetPost.media_metadata)) {
+      const item = targetPost.media_metadata[key];
+      if (item.status === "valid" && item.s) {
+        const mediaUrl = item.s.mp4 || item.s.u || item.s.gif;
+        if (mediaUrl) {
+          media.push({
+            url: decodeHtmlEntities(mediaUrl),
+            quality: "HD",
+            type: item.e === "AnimatedImage" && item.s.mp4 ? "video" : "image"
+          });
+        }
+      }
+    }
+  }
+
+  // 3. Direct Image or MP4 Preview
+  if (media.length === 0) {
+    const mp4Variant = targetPost.preview?.images?.[0]?.variants?.mp4?.source?.url;
+    if (mp4Variant) {
+      media.push({
+        url: decodeHtmlEntities(mp4Variant),
+        quality: "HD",
+        type: "video"
+      });
+    } else if (targetPost.url_overridden_by_dest && /\.(jpg|jpeg|png|webp|gif|mp4)$/i.test(targetPost.url_overridden_by_dest)) {
+      const isVideo = /\.mp4$/i.test(targetPost.url_overridden_by_dest);
+      media.push({
+        url: targetPost.url_overridden_by_dest,
+        quality: "HD",
+        type: isVideo ? "video" : "image"
+      });
+    }
+  }
+
+  return { title, thumbnail, media };
+}
+
+/**
+ * Instagram Extractor
+ * Tries public Embed/Captioned endpoint first, then authenticated page/GraphQL fetch using env.IG_COOKIE
+ */
+async function extractInstagram(urlObj, env) {
+  const match = urlObj.pathname.match(/\/(p|reel|reels|tv)\/([A-Za-z0-9_-]+)/);
+  if (!match) {
+    throw new Error("Invalid Instagram URL. Provide a link to a Reel, Post, or Video (/p/, /reel/, or /tv/).");
+  }
+  const shortcode = match[2];
+
+  // Attempt 1: Public Embed Endpoint
+  const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
+  const embedHeaders = getSpoofedHeaders({
+    Referer: "https://www.instagram.com/"
   });
+  if (env.IG_COOKIE) {
+    embedHeaders["Cookie"] = env.IG_COOKIE;
+  }
+
+  const embedRes = await fetch(embedUrl, { headers: embedHeaders });
+  if (embedRes.ok) {
+    const html = await embedRes.text();
+    const parsedEmbed = parseInstagramHtml(html);
+    if (parsedEmbed.media.length > 0) {
+      return parsedEmbed;
+    }
+  }
+
+  // Attempt 2: Direct Page / JSON Query (Uses env.IG_COOKIE if provided)
+  const postHeaders = getSpoofedHeaders({
+    Referer: "https://www.instagram.com/",
+    "X-IG-App-ID": "936619743392459",
+    "X-Requested-With": "XMLHttpRequest"
+  });
+
+  if (env.IG_COOKIE) {
+    postHeaders["Cookie"] = env.IG_COOKIE;
+  }
+
+  const pageUrl = `https://www.instagram.com/p/${shortcode}/`;
+  const pageRes = await fetch(pageUrl, { headers: postHeaders });
+
+  if (pageRes.ok) {
+    const pageHtml = await pageRes.text();
+    const parsedPage = parseInstagramHtml(pageHtml);
+    if (parsedPage.media.length > 0) {
+      return parsedPage;
+    }
+  }
+
+  // Attempt 3: Instagram GraphQL Query endpoint
+  const gqlUrl = `https://www.instagram.com/graphql/query/?query_hash=b3055c01b4b222b8a47dc12b090e4e64&variables=${encodeURIComponent(JSON.stringify({ shortcode }))}`;
+  const gqlRes = await fetch(gqlUrl, { headers: postHeaders });
 
   if (gqlRes.ok) {
     const gqlJson = await gqlRes.json().catch(() => null);
-    const media = gqlJson?.data?.xdt_shortcode_media;
+    const mediaNode = gqlJson?.data?.shortcode_media;
+    if (mediaNode) {
+      const media = [];
+      const title = mediaNode.edge_media_to_caption?.edges?.[0]?.node?.text || "Instagram Media";
+      const thumbnail = mediaNode.display_url || null;
 
-    if (media) {
-      title = media.edge_media_to_caption?.edges?.[0]?.node?.text?.slice(0, 90) || title;
-      thumbnail = media.display_url;
-
-      const edges = media.edge_sidecar_to_children?.edges;
-      if (edges && edges.length > 0) {
-        for (const edge of edges) {
+      if (mediaNode.edge_sidecar_to_children?.edges) {
+        for (const edge of mediaNode.edge_sidecar_to_children.edges) {
           const node = edge.node;
           if (node.is_video && node.video_url) {
-            videos.push({
-              quality: "Original HD",
-              width: node.dimensions?.width,
-              height: node.dimensions?.height,
-              url: node.video_url
-            });
+            media.push({ url: node.video_url, quality: "HD", type: "video" });
           } else if (node.display_url) {
-            images.push({
-              url: node.display_url,
-              width: node.dimensions?.width,
-              height: node.dimensions?.height
-            });
+            media.push({ url: node.display_url, quality: "HD", type: "image" });
           }
         }
-      } else if (media.is_video && media.video_url) {
-        videos.push({
-          quality: "Original HD",
-          width: media.dimensions?.width,
-          height: media.dimensions?.height,
-          url: media.video_url
-        });
-      } else if (media.display_url) {
-        images.push({
-          url: media.display_url,
-          width: media.dimensions?.width,
-          height: media.dimensions?.height
-        });
+      } else if (mediaNode.is_video && mediaNode.video_url) {
+        media.push({ url: mediaNode.video_url, quality: "HD", type: "video" });
+      } else if (mediaNode.display_url) {
+        media.push({ url: mediaNode.display_url, quality: "HD", type: "image" });
       }
 
-      if (videos.length > 0 || images.length > 0) {
-        return { title, thumbnail, videos, images };
+      if (media.length > 0) {
+        return { title: cleanText(title), thumbnail, media };
       }
     }
   }
 
-  // രീതി 2: Embed Captioned Fallback
-  const embedRes = await fetch(`https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
-    headers: { "User-Agent": DEFAULT_UA }
+  throw new Error(
+    env.IG_COOKIE
+      ? "Instagram blocked the request or the post is private. Verify your IG_COOKIE is still active."
+      : "Instagram login wall encountered. Configure 'IG_COOKIE' in Cloudflare Worker Secrets for reliable extraction."
+  );
+}
+
+/**
+ * Pinterest Extractor
+ * Parses __PWS_DATA__, JSON-LD, and OpenGraph tags
+ */
+async function extractPinterest(urlObj) {
+  const res = await fetch(urlObj.toString(), {
+    headers: getSpoofedHeaders({ Referer: "https://www.pinterest.com/" })
   });
-  const html = await embedRes.text();
 
-  const videoMatch = html.match(/"video_url":"([^"]+)"/);
-  if (videoMatch) {
-    videos.push({
-      quality: "Original",
-      url: JSON.parse(`"${videoMatch[1]}"`)
-    });
+  if (!res.ok) {
+    throw new Error(`Pinterest returned HTTP ${res.status}`);
   }
 
-  const displayMatches = [...html.matchAll(/"display_url":"([^"]+)"/g)];
-  for (const m of displayMatches) {
-    const cleanUrl = JSON.parse(`"${m[1]}"`);
-    if (!images.some((i) => i.url === cleanUrl)) {
-      images.push({ url: cleanUrl });
+  const html = await res.text();
+  const meta = parseUniversalHtmlMeta(html);
+  const media = [...meta.media];
+
+  // Look for direct 720p/1080p MP4 streams in Pinterest's embedded state (__PWS_DATA__)
+  const mp4Matches = html.match(/https:\/\/v1\.pinimg\.com\/videos\/[^\s"'\\]+\.mp4/g);
+  if (mp4Matches && mp4Matches.length > 0) {
+    const uniqueMp4s = [...new Set(mp4Matches.map(u => decodeEscapedUrl(u)))];
+    for (const url of uniqueMp4s) {
+      if (!media.some(m => m.url === url)) {
+        media.unshift({
+          url,
+          quality: url.includes("720p") || url.includes("1080p") ? "HD" : "SD",
+          type: "video"
+        });
+      }
     }
   }
 
-  if (videos.length === 0 && images.length === 0) {
-    throw new Error("Instagram media could not be extracted (Post may be private).");
+  // Fallback to high-res image pin if no video found
+  if (media.length === 0) {
+    const origImgMatch = html.match(/https:\/\/i\.pinimg\.com\/originals\/[^\s"'\\]+\.(?:jpg|png|webp|gif)/i);
+    if (origImgMatch) {
+      media.push({
+        url: decodeEscapedUrl(origImgMatch[0]),
+        quality: "HD",
+        type: "image"
+      });
+    } else if (meta.thumbnail) {
+      media.push({
+        url: meta.thumbnail,
+        quality: "HD",
+        type: "image"
+      });
+    }
   }
 
   return {
-    title,
-    thumbnail: images[0]?.url || null,
-    videos,
-    images: videos.length > 0 ? [] : images
+    title: meta.title || "Pinterest Pin",
+    thumbnail: meta.thumbnail,
+    media
   };
 }
 
 /**
- * MODULE 4: THREADS (threads.net / threads.com)
- * Parses embedded Relay JSON & OpenGraph tags for Original Video/Photo URLs
+ * Facebook Public Video Extractor
+ * Extracts HD/SD MP4 streams from embedded Relay JSON and OpenGraph tags
  */
-async function extractThreads(url) {
-  const cleanUrl = url.split("?")[0];
-  const res = await fetch(cleanUrl, {
-    headers: {
-      "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-      Accept: "text/html,application/xhtml+xml"
-    }
+async function extractFacebook(urlObj, env) {
+  const headers = getSpoofedHeaders({
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    Referer: "https://www.facebook.com/"
   });
+  if (env.FB_COOKIE) {
+    headers["Cookie"] = env.FB_COOKIE;
+  }
 
-  if (!res.ok) throw new Error(`Threads fetch failed: ${res.status}`);
+  const res = await fetch(urlObj.toString(), { headers });
+  if (!res.ok) {
+    throw new Error(`Facebook returned HTTP ${res.status}`);
+  }
+
   const html = await res.text();
-
-  const videos = [];
-  const images = [];
-
-  // JSON-ൽ നിന്നുള്ള video_versions വേർതിരിക്കുന്നു
-  const videoVersionMatches = [...html.matchAll(/"video_versions":\[(.*?)\]/g)];
-  for (const match of videoVersionMatches) {
-    const urlMatches = [...match[1].matchAll(/"url":"([^"]+)"/g)];
-    if (urlMatches.length > 0) {
-      const rawVideoUrl = JSON.parse(`"${urlMatches[0][1]}"`);
-      if (!videos.some((v) => v.url === rawVideoUrl)) {
-        videos.push({ quality: "Original HD", url: rawVideoUrl });
-      }
-    }
-  }
-
-  // OpenGraph Video Fallback
-  const ogVideo = matchMetaContent(html, "og:video") || matchMetaContent(html, "og:video:secure_url");
-  if (ogVideo && !videos.some((v) => v.url === ogVideo)) {
-    videos.push({ quality: "HD", url: decodeHtmlEntities(ogVideo) });
-  }
-
-  // Images extraction
-  const ogImage = matchMetaContent(html, "og:image");
-  if (ogImage && videos.length === 0) {
-    images.push({ url: decodeHtmlEntities(ogImage) });
-  }
-
-  const title = matchMetaContent(html, "og:title") || "Threads Post";
-
-  if (videos.length === 0 && images.length === 0) {
-    throw new Error("No media found in this Threads link.");
-  }
-
-  return {
-    title: decodeHtmlEntities(title),
-    thumbnail: ogImage ? decodeHtmlEntities(ogImage) : null,
-    videos,
-    images
-  };
-}
-
-/**
- * MODULE 5: FACEBOOK
- * Resolves fb.watch / Reels / Videos & Extracts HD/SD Native Streams
- */
-async function extractFacebook(url) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Sec-Fetch-Mode": "navigate"
-    },
-    redirect: "follow"
-  });
-
-  if (!res.ok) throw new Error(`Facebook fetch error: ${res.status}`);
-  const html = await res.text();
-
-  const videos = [];
-  const images = [];
+  const meta = parseUniversalHtmlMeta(html);
+  const media = [];
 
   const hdPatterns = [
-    /"browser_native_hd_url":"([^"]+)"/,
-    /"hd_src":"([^"]+)"/,
-    /"hd_src_no_ratelimit":"([^"]+)"/,
-    /"playable_url_quality_hd":"([^"]+)"/
+    /"browser_native_hd_url"\s*:\s*"([^"]+)"/,
+    /"playable_url_quality_hd"\s*:\s*"([^"]+)"/,
+    /"hd_src_no_ratelimit"\s*:\s*"([^"]+)"/,
+    /"hd_src"\s*:\s*"([^"]+)"/
   ];
 
   const sdPatterns = [
-    /"browser_native_sd_url":"([^"]+)"/,
-    /"sd_src":"([^"]+)"/,
-    /"sd_src_no_ratelimit":"([^"]+)"/,
-    /"playable_url":"([^"]+)"/
+    /"browser_native_sd_url"\s*:\s*"([^"]+)"/,
+    /"playable_url"\s*:\s*"([^"]+)"/,
+    /"sd_src_no_ratelimit"\s*:\s*"([^"]+)"/,
+    /"sd_src"\s*:\s*"([^"]+)"/
   ];
 
   for (const pattern of hdPatterns) {
-    const m = html.match(pattern);
-    if (m && m[1] !== "null") {
-      videos.push({ quality: "HD", url: cleanJsonEscapedUrl(m[1]) });
+    const match = html.match(pattern);
+    if (match && match[1] && match[1] !== "null") {
+      media.push({
+        url: decodeEscapedUrl(match[1]),
+        quality: "HD",
+        type: "video"
+      });
       break;
     }
   }
 
   for (const pattern of sdPatterns) {
-    const m = html.match(pattern);
-    if (m && m[1] !== "null") {
-      videos.push({ quality: "SD", url: cleanJsonEscapedUrl(m[1]) });
+    const match = html.match(pattern);
+    if (match && match[1] && match[1] !== "null") {
+      const decoded = decodeEscapedUrl(match[1]);
+      if (!media.some(m => m.url === decoded)) {
+        media.push({
+          url: decoded,
+          quality: "SD",
+          type: "video"
+        });
+      }
       break;
     }
   }
 
-  const ogVideo = matchMetaContent(html, "og:video") || matchMetaContent(html, "og:video:url");
-  if (ogVideo && videos.length === 0) {
-    videos.push({ quality: "Standard", url: decodeHtmlEntities(ogVideo) });
-  }
-
-  const ogImage = matchMetaContent(html, "og:image");
-  if (ogImage && videos.length === 0) {
-    images.push({ url: decodeHtmlEntities(ogImage) });
-  }
-
-  if (videos.length === 0 && images.length === 0) {
-    throw new Error("Could not extract Facebook media. Ensure the post is public.");
+  for (const item of meta.media) {
+    if (!media.some(m => m.url === item.url)) {
+      media.push(item);
+    }
   }
 
   return {
-    title: decodeHtmlEntities(matchMetaContent(html, "og:title") || "Facebook Media"),
-    thumbnail: ogImage ? decodeHtmlEntities(ogImage) : null,
-    videos,
-    images
+    title: meta.title || "Facebook Video",
+    thumbnail: meta.thumbnail,
+    media
+  };
+}
+
+/* ============================================================================
+ * PARSING & UTILITY HELPERS
+ * ========================================================================== */
+
+function isYouTubeUrl(hostname) {
+  const host = hostname.toLowerCase();
+  return (
+    host === "youtube.com" ||
+    host.endsWith(".youtube.com") ||
+    host === "youtu.be" ||
+    host === "youtube-nocookie.com"
+  );
+}
+
+function detectPlatform(hostname) {
+  const host = hostname.toLowerCase();
+  if (host.includes("instagram.com")) return "instagram";
+  if (host.includes("twitter.com") || host.includes("x.com") || host === "t.co") return "x";
+  if (host.includes("pinterest.") || host === "pin.it") return "pinterest";
+  if (host.includes("reddit.com") || host === "redd.it") return "reddit";
+  if (host.includes("facebook.com") || host === "fb.watch" || host === "fb.com") return "facebook";
+  return null;
+}
+
+function getRandomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function getSpoofedHeaders(extra = {}) {
+  return {
+    "User-Agent": getRandomUA(),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+    ...extra
   };
 }
 
 /**
- * MODULE 6: SNAPCHAT
- * Extracts Spotlight & Public Story Videos/Images via __NEXT_DATA__
+ * Universal HTML Metadata Parser (OpenGraph, Twitter Cards, JSON-LD)
  */
-async function extractSnapchat(url) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": DEFAULT_UA,
-      Accept: "text/html,application/xhtml+xml"
-    },
-    redirect: "follow"
-  });
+function parseUniversalHtmlMeta(html) {
+  const media = [];
+  let title = extractMetaContent(html, ["og:title", "twitter:title"]);
+  let thumbnail = extractMetaContent(html, ["og:image", "twitter:image", "twitter:image:src"]);
 
-  if (!res.ok) throw new Error(`Snapchat fetch error: ${res.status}`);
-  const html = await res.text();
+  if (!title) {
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    if (titleMatch) title = cleanText(titleMatch[1]);
+  }
 
-  const videos = [];
-  const images = [];
-  let thumbnail = matchMetaContent(html, "og:image");
-  let title = matchMetaContent(html, "og:title") || "Snapchat Media";
+  const videoUrl = extractMetaContent(html, [
+    "og:video:secure_url",
+    "og:video:url",
+    "og:video",
+    "twitter:player:stream"
+  ]);
 
-  // __NEXT_DATA__ JSON പേലോഡ് പരിശോധിക്കുന്നു
-  const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-  if (nextDataMatch) {
+  if (videoUrl && videoUrl.startsWith("http")) {
+    media.push({
+      url: decodeHtmlEntities(videoUrl),
+      quality: "HD",
+      type: "video"
+    });
+  }
+
+  const ldJsonRegex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = ldJsonRegex.exec(html)) !== null) {
     try {
-      const nextJson = JSON.parse(nextDataMatch[1]);
-      const pageProps = nextJson?.props?.pageProps || {};
-
-      // Spotlight & Story Media URLs കണ്ടെത്തുന്നു
-      const jsonStr = JSON.stringify(pageProps);
-      const mp4Matches = [...jsonStr.matchAll(/"(https:\/\/[^"]+\.sc-cdn\.net\/[^"]+)"/g)];
-
-      for (const m of mp4Matches) {
-        const candidateUrl = m[1];
-        if (/video|\.mp4|\.(?:m3u8)/i.test(candidateUrl) || candidateUrl.includes("/d/")) {
-          if (!videos.some((v) => v.url === candidateUrl)) {
-            videos.push({ quality: "Original HD", url: candidateUrl });
+      const jsonData = JSON.parse(match[1].trim());
+      const items = Array.isArray(jsonData) ? jsonData : [jsonData];
+      for (const item of items) {
+        if (!title && (item.name || item.headline)) {
+          title = cleanText(item.name || item.headline);
+        }
+        if (!thumbnail && item.thumbnailUrl) {
+          thumbnail = Array.isArray(item.thumbnailUrl) ? item.thumbnailUrl[0] : item.thumbnailUrl;
+        }
+        const contentUrl = item.contentUrl || item.video?.contentUrl;
+        if (contentUrl && typeof contentUrl === "string" && contentUrl.startsWith("http")) {
+          if (!media.some(m => m.url === contentUrl)) {
+            media.push({
+              url: contentUrl,
+              quality: "HD",
+              type: "video"
+            });
           }
         }
       }
-
-      const snapMediaUrl =
-        pageProps?.curatedHighlights?.[0]?.snapList?.[0]?.snapUrls?.mediaUrl ||
-        pageProps?.story?.snapList?.[0]?.snapUrls?.mediaUrl ||
-        pageProps?.spotlightFeed?.spotlightStories?.[0]?.snapList?.[0]?.snapUrls?.mediaUrl;
-
-      if (snapMediaUrl && !videos.some((v) => v.url === snapMediaUrl)) {
-        videos.unshift({ quality: "Original HD", url: snapMediaUrl });
-      }
-    } catch {
-      // Fallback to meta tags below
+    } catch (_) {
+      // Ignore malformed JSON-LD blocks
     }
-  }
-
-  const ogVideo = matchMetaContent(html, "og:video") || matchMetaContent(html, "og:video:secure_url");
-  if (ogVideo && !videos.some((v) => v.url === ogVideo)) {
-    videos.push({ quality: "HD", url: decodeHtmlEntities(ogVideo) });
-  }
-
-  if (videos.length === 0 && thumbnail) {
-    images.push({ url: decodeHtmlEntities(thumbnail) });
-  }
-
-  if (videos.length === 0 && images.length === 0) {
-    throw new Error("No public Snapchat media found at this URL.");
   }
 
   return {
-    title: decodeHtmlEntities(title),
+    title: title ? decodeHtmlEntities(title) : null,
     thumbnail: thumbnail ? decodeHtmlEntities(thumbnail) : null,
-    videos,
-    images
+    media
   };
 }
 
-// ==========================================
-// 6. HELPER UTILITIES
-// ==========================================
-function jsonResponse(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...CORS_HEADERS
-    }
-  });
-}
+/**
+ * Instagram HTML & Embedded JSON Parser
+ * Extracts all unique videos and high-res carousel images while filtering out avatars/thumbnails
+ */
+function parseInstagramHtml(html) {
+  const base = parseUniversalHtmlMeta(html);
+  const media = [];
+  const seenUrls = new Set();
 
-function matchMetaContent(html, property) {
-  const regex1 = new RegExp(`<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']+)["']`, "i");
-  const regex2 = new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${property}["']`, "i");
-  return html.match(regex1)?.[1] || html.match(regex2)?.[1] || null;
-}
+  const addMediaItem = (url, type, quality = "HD") => {
+    if (!url || !url.startsWith("http")) return;
+    // Normalize URL key without volatile byte-range query params for deduplication
+    const dedupeKey = url.split("?")[0];
+    if (seenUrls.has(dedupeKey) || seenUrls.has(url)) return;
+    seenUrls.add(dedupeKey);
+    seenUrls.add(url);
+    media.push({ url, quality, type });
+  };
 
-function cleanJsonEscapedUrl(raw) {
-  try {
-    return JSON.parse(`"${raw}"`);
-  } catch {
-    return raw.replace(/\\\//g, "/").replace(/\\u0025/g, "%").replace(/\\u0026/g, "&");
+  for (const item of base.media) {
+    addMediaItem(item.url, item.type, item.quality);
   }
+
+  // 1. Extract escaped video_url from embedded Instagram scripts
+  const videoUrlMatches = html.matchAll(/"video_url"\s*:\s*"([^"]+)"/g);
+  for (const m of videoUrlMatches) {
+    addMediaItem(decodeEscapedUrl(m[1]), "video", "HD");
+  }
+
+  // 2. Extract video_versions array from Polaris/Relay JSON
+  const versionMatches = html.matchAll(/"video_versions"\s*:\s*\[\s*\{[^}]*"url"\s*:\s*"([^"]+)"/g);
+  for (const m of versionMatches) {
+    addMediaItem(decodeEscapedUrl(m[1]), "video", "HD");
+  }
+
+  // 3. Extract all high-res display_url / display_resources images (supporting mixed carousels)
+  const displayMatches = html.matchAll(/"display_url"\s*:\s*"([^"]+)"/g);
+  for (const m of displayMatches) {
+    const url = decodeEscapedUrl(m[1]);
+    if (!isLowResOrAvatarInstagramImage(url)) {
+      addMediaItem(url, "image", "HD");
+    }
+  }
+
+  // 4. Also check Embed HTML class="EmbeddedMediaImage" src attributes for single image embeds
+  const embedImgMatches = html.matchAll(/class=["'][^"']*EmbeddedMediaImage[^"']*["'][^>]+src=["']([^"']+)["']/gi);
+  for (const m of embedImgMatches) {
+    const url = decodeHtmlEntities(m[1]);
+    if (!isLowResOrAvatarInstagramImage(url)) {
+      addMediaItem(url, "image", "HD");
+    }
+  }
+
+  return {
+    title: base.title || "Instagram Media",
+    thumbnail: base.thumbnail,
+    media
+  };
+}
+
+/**
+ * Filters out small profile avatars (s150x150, p150x150, etc.) and static UI assets
+ */
+function isLowResOrAvatarInstagramImage(url) {
+  if (!url) return true;
+  const lower = url.toLowerCase();
+  if (
+    lower.includes("/s150x150/") ||
+    lower.includes("/p150x150/") ||
+    lower.includes("/s100x100/") ||
+    lower.includes("/s64x64/") ||
+    lower.includes("/s320x320/") ||
+    lower.includes("profile_pic") ||
+    lower.includes("t51.2885-19") // Instagram's CDN path bucket for user profile avatars
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function computeSyndicationToken(idStr) {
+  return ((Number(idStr) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, "");
+}
+
+function parseSyndicationData(data) {
+  const title = cleanText(data.text || "X Media");
+  let thumbnail = data.photos?.[0]?.url || null;
+  const media = [];
+
+  if (Array.isArray(data.mediaDetails)) {
+    for (const item of data.mediaDetails) {
+      if (!thumbnail && item.media_url_https) {
+        thumbnail = item.media_url_https;
+      }
+      if (item.type === "video" || item.type === "animated_gif") {
+        const variants = (item.video_info?.variants || [])
+          .filter(v => v.content_type === "video/mp4")
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+
+        if (variants.length > 0) {
+          media.push({
+            url: variants[0].url,
+            quality: (variants[0].bitrate || 0) >= 2000000 ? "HD" : "SD",
+            type: "video"
+          });
+        }
+      } else if (item.type === "photo" && item.media_url_https) {
+        media.push({
+          url: `${item.media_url_https}?name=orig`,
+          quality: "HD",
+          type: "image"
+        });
+      }
+    }
+  }
+
+  return { title, thumbnail, media };
+}
+
+function extractMetaContent(html, propNames) {
+  for (const name of propNames) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex1 = new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["']`, "i");
+    const match1 = html.match(regex1);
+    if (match1 && match1[1]) return match1[1];
+
+    const regex2 = new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${escaped}["']`, "i");
+    const match2 = html.match(regex2);
+    if (match2 && match2[1]) return match2[1];
+  }
+  return null;
+}
+
+function decodeEscapedUrl(str) {
+  return decodeHtmlEntities(
+    str
+      .replace(/\\u0026/g, "&")
+      .replace(/\\u0025/g, "%")
+      .replace(/\\\//g, "/")
+      .replace(/\\"/g, '"')
+  );
 }
 
 function decodeHtmlEntities(str) {
   if (!str) return "";
   return str
     .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&#x27;/g, "'")
     .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x2F;/g, "/");
+}
+
+function cleanText(str) {
+  return decodeHtmlEntities(str).replace(/\s+/g, " ").trim();
+}
+
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: CORS_HEADERS
+  });
 }
